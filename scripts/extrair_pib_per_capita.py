@@ -5,18 +5,21 @@ from __future__ import annotations
 
 import csv
 import hashlib
+from html.parser import HTMLParser
 import io
 import json
 import re
 import sys
 import unicodedata
+from urllib.parse import unquote, urljoin, urlparse
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-FONTE_ORIGINAL_IBGE = (
+RAIZ_IBGE = "https://ftp.ibge.gov.br/Pib_Municipios/"
+FALLBACK_FONTE_ORIGINAL_IBGE = (
     "https://ftp.ibge.gov.br/Pib_Municipios/2022_2023/base/"
     "base_de_dados_2010_2023_txt.zip"
 )
@@ -33,6 +36,20 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT_DIR / "data"
 CSV_SAIDA = DATA_DIR / "ibge_pib_per_capita_nordeste.csv"
 METADATA_SAIDA = DATA_DIR / "ibge_pib_per_capita_metadata.json"
+
+
+class LinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        for nome, valor in attrs:
+            if nome.lower() == "href" and valor:
+                self.links.append(valor)
+                return
 
 
 def log(mensagem: str) -> None:
@@ -53,6 +70,103 @@ def baixar_zip(url: str) -> bytes:
         conteudo = resposta.read()
     log(f"ZIP baixado: {len(conteudo):,} bytes")
     return conteudo
+
+
+def baixar_html(url: str) -> str:
+    log(f"Lendo indice do FTP do IBGE: {url}")
+    with urllib.request.urlopen(url, timeout=60) as resposta:
+        conteudo = resposta.read()
+    return conteudo.decode("utf-8", errors="replace")
+
+
+def extrair_links(html: str) -> list[str]:
+    parser = LinkParser()
+    parser.feed(html)
+    return parser.links
+
+
+def nome_link(link: str) -> str:
+    return unquote(urlparse(link).path.rstrip("/").split("/")[-1])
+
+
+def ano_final_pasta(link: str) -> int | None:
+    nome = nome_link(link)
+    match = re.fullmatch(r"(\d{4})(?:_(\d{4}))?", nome)
+    if not match:
+        return None
+    return int(match.group(2) or match.group(1))
+
+
+def descobrir_fonte_mais_recente() -> tuple[str, bool, bool]:
+    """Retorna URL da base, flag de descoberta automatica habilitada e flag de fallback."""
+    try:
+        links_raiz = extrair_links(baixar_html(RAIZ_IBGE))
+        pastas: list[tuple[int, str]] = []
+        for link in links_raiz:
+            ano_final = ano_final_pasta(link)
+            if ano_final is None:
+                continue
+            pasta_url = urljoin(RAIZ_IBGE, link)
+            if not pasta_url.endswith("/"):
+                pasta_url += "/"
+            pastas.append((ano_final, pasta_url))
+
+        if not pastas:
+            raise RuntimeError("Nenhuma pasta YYYY ou YYYY_YYYY encontrada.")
+
+        pastas.sort(key=lambda item: item[0], reverse=True)
+        log(
+            "Pastas candidatas encontradas: "
+            + ", ".join(f"{url.rstrip('/').split('/')[-1]} ({ano})" for ano, url in pastas[:8])
+        )
+
+        bases_encontradas: list[tuple[int, int, str]] = []
+
+        for indice, (ano_pasta, pasta_url) in enumerate(pastas):
+            base_url = urljoin(pasta_url, "base/")
+            try:
+                links_base = extrair_links(baixar_html(base_url))
+            except Exception as exc:
+                log(f"Nao foi possivel ler {base_url}: {exc}")
+                continue
+
+            zips: list[tuple[int, str]] = []
+            for link in links_base:
+                nome = nome_link(link)
+                match = re.fullmatch(r"base_de_dados_2010_(\d{4})_txt\.zip", nome)
+                if not match:
+                    continue
+                ano_zip = int(match.group(1))
+                zips.append((ano_zip, urljoin(base_url, link)))
+
+            if not zips:
+                log(f"Nenhum ZIP TXT de base encontrado em {base_url}")
+                continue
+
+            zips.sort(key=lambda item: item[0], reverse=True)
+            ano_zip, url_zip = zips[0]
+            bases_encontradas.append((ano_zip, ano_pasta, url_zip))
+
+            proxima_pasta = pastas[indice + 1][0] if indice + 1 < len(pastas) else -1
+            maior_ano_zip = max(base[0] for base in bases_encontradas)
+            if maior_ano_zip >= proxima_pasta:
+                break
+
+        if bases_encontradas:
+            bases_encontradas.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            ano_zip, ano_pasta, url_zip = bases_encontradas[0]
+            log(
+                "Base descoberta automaticamente: "
+                f"pasta final {ano_pasta}, arquivo final {ano_zip}"
+            )
+            log(f"URL escolhida: {url_zip}")
+            return url_zip, True, False
+
+        raise RuntimeError("Nenhuma pasta candidata continha base TXT ZIP compativel.")
+    except Exception as exc:
+        log(f"Descoberta automatica falhou: {exc}")
+        log(f"Fallback usado: {FALLBACK_FONTE_ORIGINAL_IBGE}")
+        return FALLBACK_FONTE_ORIGINAL_IBGE, True, True
 
 
 def sha256(conteudo: bytes) -> str:
@@ -324,19 +438,24 @@ def escrever_csv(registros: list[dict[str, str]]) -> None:
 
 
 def escrever_metadata(
+    fonte_original_ibge: str,
     ano_usado: int,
     sha_zip: str,
     arquivo_interno: str,
     quantidade_registros: int,
+    descoberta_automatica_base: bool,
+    fallback_usado: bool,
 ) -> None:
     metadata = {
-        "fonte_original_ibge": FONTE_ORIGINAL_IBGE,
+        "fonte_original_ibge": fonte_original_ibge,
         "data_extracao": datetime.now(timezone.utc).isoformat(),
         "ano_usado": ano_usado,
         "sha256_zip_original": sha_zip,
         "arquivo_interno": arquivo_interno,
         "quantidade_registros": quantidade_registros,
         "metodo": "Campo oficial do IBGE, sem cálculo local PIB/população.",
+        "descoberta_automatica_base": descoberta_automatica_base,
+        "fallback_usado": fallback_usado,
         "observacao": (
             "CSV filtrado para municipios do Nordeste, identificados pelos "
             "prefixos IBGE 21, 22, 23, 24, 25, 26, 27, 28 e 29."
@@ -351,7 +470,10 @@ def escrever_metadata(
 
 def main() -> int:
     try:
-        zip_bytes = baixar_zip(FONTE_ORIGINAL_IBGE)
+        fonte_original_ibge, descoberta_automatica_base, fallback_usado = (
+            descobrir_fonte_mais_recente()
+        )
+        zip_bytes = baixar_zip(fonte_original_ibge)
         sha_zip = sha256(zip_bytes)
         log(f"SHA-256 do ZIP original: {sha_zip}")
 
@@ -373,7 +495,15 @@ def main() -> int:
                 ) from exc
 
         escrever_csv(registros)
-        escrever_metadata(ano_usado, sha_zip, txt_info.filename, len(registros))
+        escrever_metadata(
+            fonte_original_ibge,
+            ano_usado,
+            sha_zip,
+            txt_info.filename,
+            len(registros),
+            descoberta_automatica_base,
+            fallback_usado,
+        )
         log("Extracao concluida com sucesso.")
         return 0
     except Exception as exc:
