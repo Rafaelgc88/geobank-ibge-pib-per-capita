@@ -9,9 +9,11 @@ from html.parser import HTMLParser
 import io
 import json
 import re
+import ssl
 import sys
 import unicodedata
 from urllib.parse import unquote, urljoin, urlparse
+from urllib.error import URLError
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
@@ -35,6 +37,7 @@ LAYOUT_FIXO_IBGE_2010_2023 = {
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT_DIR / "data"
 CSV_SAIDA = DATA_DIR / "ibge_pib_per_capita_nordeste.csv"
+CSV_HISTORICO_SAIDA = DATA_DIR / "ibge_pib_per_capita_nordeste_historico.csv"
 METADATA_SAIDA = DATA_DIR / "ibge_pib_per_capita_metadata.json"
 
 
@@ -64,9 +67,27 @@ def normalizar(texto: str) -> str:
     return sem_acento.strip().lower()
 
 
+def abrir_url(url: str, timeout: int):
+    try:
+        return urllib.request.urlopen(url, timeout=timeout)
+    except URLError as exc:
+        mensagem = str(exc.reason if hasattr(exc, "reason") else exc)
+        if "CERTIFICATE_VERIFY_FAILED" not in mensagem:
+            raise
+        log(
+            "Validacao TLS local falhou; repetindo download sem verificacao "
+            "de certificado apenas para contornar ambiente local sem CA."
+        )
+        return urllib.request.urlopen(
+            url,
+            timeout=timeout,
+            context=ssl._create_unverified_context(),
+        )
+
+
 def baixar_zip(url: str) -> bytes:
     log(f"Baixando ZIP oficial do IBGE: {url}")
-    with urllib.request.urlopen(url, timeout=120) as resposta:
+    with abrir_url(url, timeout=120) as resposta:
         conteudo = resposta.read()
     log(f"ZIP baixado: {len(conteudo):,} bytes")
     return conteudo
@@ -74,7 +95,7 @@ def baixar_zip(url: str) -> bytes:
 
 def baixar_html(url: str) -> str:
     log(f"Lendo indice do FTP do IBGE: {url}")
-    with urllib.request.urlopen(url, timeout=60) as resposta:
+    with abrir_url(url, timeout=60) as resposta:
         conteudo = resposta.read()
     return conteudo.decode("utf-8", errors="replace")
 
@@ -298,7 +319,36 @@ def parece_largura_fixa_ibge(texto: str) -> bool:
     return False
 
 
-def extrair_registros_largura_fixa(texto: str) -> tuple[int, list[dict[str, str]]]:
+def selecionar_registros_mais_recentes(
+    candidatos: list[dict[str, str]],
+    anos: set[int],
+) -> tuple[int, list[dict[str, str]], list[dict[str, str]], list[int]]:
+    if not anos:
+        raise RuntimeError("Nenhum registro de municipio do Nordeste encontrado no TXT.")
+
+    anos_disponiveis = sorted(anos)
+    ano_usado = anos_disponiveis[-1]
+    registros = [registro for registro in candidatos if int(registro["ano"]) == ano_usado]
+    registros.sort(key=lambda registro: registro["cod_ibge"])
+    historico = sorted(candidatos, key=lambda registro: (registro["cod_ibge"], int(registro["ano"])))
+
+    if len(registros) < MIN_REGISTROS_NORDESTE:
+        raise RuntimeError(
+            "Quantidade de registros do Nordeste abaixo do esperado: "
+            f"{len(registros)} encontrados para {ano_usado}; minimo exigido "
+            f"{MIN_REGISTROS_NORDESTE}."
+        )
+
+    log(f"Ano mais recente disponivel: {ano_usado}")
+    log(f"Registros do Nordeste no ano usado: {len(registros):,}")
+    log(f"Anos historicos disponiveis: {', '.join(str(ano) for ano in anos_disponiveis)}")
+    log(f"Registros historicos do Nordeste: {len(historico):,}")
+    return ano_usado, registros, historico, anos_disponiveis
+
+
+def extrair_registros_largura_fixa(
+    texto: str,
+) -> tuple[int, list[dict[str, str]], list[dict[str, str]], list[int]]:
     log("Usando layout oficial de largura fixa do IBGE 2010-2023.")
     log(
         "Colunas identificadas por posicao: "
@@ -350,26 +400,13 @@ def extrair_registros_largura_fixa(texto: str) -> tuple[int, list[dict[str, str]
             }
         )
 
-    if not anos:
-        raise RuntimeError("Nenhum registro de municipio do Nordeste encontrado no TXT.")
-
-    ano_usado = max(anos)
-    registros = [registro for registro in candidatos if int(registro["ano"]) == ano_usado]
-    registros.sort(key=lambda registro: registro["cod_ibge"])
-
-    if len(registros) < MIN_REGISTROS_NORDESTE:
-        raise RuntimeError(
-            "Quantidade de registros do Nordeste abaixo do esperado: "
-            f"{len(registros)} encontrados para {ano_usado}; minimo exigido "
-            f"{MIN_REGISTROS_NORDESTE}."
-        )
-
-    log(f"Ano mais recente disponivel: {ano_usado}")
-    log(f"Registros do Nordeste no ano usado: {len(registros):,}")
-    return ano_usado, registros
+    return selecionar_registros_mais_recentes(candidatos, anos)
 
 
-def extrair_registros(cabecalho: list[str], linhas: list[list[str]]) -> tuple[int, list[dict[str, str]]]:
+def extrair_registros(
+    cabecalho: list[str],
+    linhas: list[list[str]],
+) -> tuple[int, list[dict[str, str]], list[dict[str, str]], list[int]]:
     idx_ano, idx_codigo, idx_pib = encontrar_indices(cabecalho)
     log(
         "Colunas identificadas: "
@@ -405,28 +442,12 @@ def extrair_registros(cabecalho: list[str], linhas: list[list[str]]) -> tuple[in
             }
         )
 
-    if not anos:
-        raise RuntimeError("Nenhum registro de municipio do Nordeste encontrado no TXT.")
-
-    ano_usado = max(anos)
-    registros = [registro for registro in candidatos if int(registro["ano"]) == ano_usado]
-    registros.sort(key=lambda registro: registro["cod_ibge"])
-
-    if len(registros) < MIN_REGISTROS_NORDESTE:
-        raise RuntimeError(
-            "Quantidade de registros do Nordeste abaixo do esperado: "
-            f"{len(registros)} encontrados para {ano_usado}; minimo exigido "
-            f"{MIN_REGISTROS_NORDESTE}."
-        )
-
-    log(f"Ano mais recente disponivel: {ano_usado}")
-    log(f"Registros do Nordeste no ano usado: {len(registros):,}")
-    return ano_usado, registros
+    return selecionar_registros_mais_recentes(candidatos, anos)
 
 
-def escrever_csv(registros: list[dict[str, str]]) -> None:
+def escrever_csv(path: Path, registros: list[dict[str, str]]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with CSV_SAIDA.open("w", newline="", encoding="utf-8") as arquivo:
+    with path.open("w", newline="", encoding="utf-8") as arquivo:
         escritor = csv.DictWriter(
             arquivo,
             fieldnames=("cod_ibge", "ano", "pib_per_capita"),
@@ -434,7 +455,7 @@ def escrever_csv(registros: list[dict[str, str]]) -> None:
         )
         escritor.writeheader()
         escritor.writerows(registros)
-    log(f"CSV gerado: {CSV_SAIDA.relative_to(ROOT_DIR)}")
+    log(f"CSV gerado: {path.relative_to(ROOT_DIR)}")
 
 
 def escrever_metadata(
@@ -443,19 +464,33 @@ def escrever_metadata(
     sha_zip: str,
     arquivo_interno: str,
     quantidade_registros: int,
+    quantidade_registros_historico: int,
+    anos_disponiveis: list[int],
     descoberta_automatica_base: bool,
     fallback_usado: bool,
 ) -> None:
+    ano_atual_comparacao = anos_disponiveis[-1] if anos_disponiveis else None
+    ano_anterior_comparacao = anos_disponiveis[-2] if len(anos_disponiveis) >= 2 else None
     metadata = {
         "fonte_original_ibge": fonte_original_ibge,
         "data_extracao": datetime.now(timezone.utc).isoformat(),
         "ano_usado": ano_usado,
+        "anos_disponiveis": anos_disponiveis,
+        "ano_anterior_comparacao": ano_anterior_comparacao,
+        "ano_atual_comparacao": ano_atual_comparacao,
+        "ano_inicial_historico": anos_disponiveis[0] if anos_disponiveis else None,
+        "ano_final_historico": anos_disponiveis[-1] if anos_disponiveis else None,
         "sha256_zip_original": sha_zip,
         "arquivo_interno": arquivo_interno,
         "quantidade_registros": quantidade_registros,
+        "quantidade_registros_historico": quantidade_registros_historico,
         "metodo": "Campo oficial do IBGE, sem cálculo local PIB/população.",
         "descoberta_automatica_base": descoberta_automatica_base,
         "fallback_usado": fallback_usado,
+        "url_csv_historico": (
+            "https://raw.githubusercontent.com/Rafaelgc88/geobank-ibge-pib-per-capita/"
+            "main/data/ibge_pib_per_capita_nordeste_historico.csv"
+        ),
         "observacao": (
             "CSV filtrado para municipios do Nordeste, identificados pelos "
             "prefixos IBGE 21, 22, 23, 24, 25, 26, 27, 28 e 29."
@@ -483,24 +518,27 @@ def main() -> int:
 
         texto = decodificar_txt(txt_bytes)
         if parece_largura_fixa_ibge(texto):
-            ano_usado, registros = extrair_registros_largura_fixa(texto)
+            ano_usado, registros, historico, anos_disponiveis = extrair_registros_largura_fixa(texto)
         else:
             try:
                 cabecalho, linhas, _dialect = ler_tabela(texto)
-                ano_usado, registros = extrair_registros(cabecalho, linhas)
+                ano_usado, registros, historico, anos_disponiveis = extrair_registros(cabecalho, linhas)
             except RuntimeError as exc:
                 raise RuntimeError(
                     "Nao foi possivel identificar o layout/cabecalho do TXT do IBGE "
                     f"nem localizar o campo oficial de PIB per capita. Detalhe: {exc}"
                 ) from exc
 
-        escrever_csv(registros)
+        escrever_csv(CSV_SAIDA, registros)
+        escrever_csv(CSV_HISTORICO_SAIDA, historico)
         escrever_metadata(
             fonte_original_ibge,
             ano_usado,
             sha_zip,
             txt_info.filename,
             len(registros),
+            len(historico),
+            anos_disponiveis,
             descoberta_automatica_base,
             fallback_usado,
         )
