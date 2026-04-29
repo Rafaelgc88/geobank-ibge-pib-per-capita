@@ -1,0 +1,37 @@
+name: Atualizar PIB per capita IBGE
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 1 * *"
+
+permissions:
+  contents: write
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Extrair PIB per capita oficial do IBGE
+        run: python scripts/extrair_pib_per_capita.py
+
+      - name: Commit dos dados gerados
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/ibge_pib_per_capita_nordeste.csv data/ibge_pib_per_capita_metadata.json
+          if git diff --cached --quiet; then
+            echo "Sem alteracoes em data/."
+          else
+            git commit -m "Atualiza PIB per capita IBGE"
+            git push
+          fi
